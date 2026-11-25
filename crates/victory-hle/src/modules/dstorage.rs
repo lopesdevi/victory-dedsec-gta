@@ -748,6 +748,22 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        // Full of what the title has not submitted: nothing else would make
+        // room, so the queue hands it to the workers itself.
+        let held = lane.unsubmitted.len();
+        if held > 0 {
+            lanes.submit(id);
+            scheduler.work.notify_all();
+            let full = FULL_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if full <= 8 || full.is_power_of_two() {
+                tracing::warn!(
+                    held,
+                    times = full,
+                    "dstorage: a full queue the title has not submitted is handed to the workers; \
+                     it may not have named every destination yet"
+                );
+            }
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -757,10 +773,32 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    // The title names a request's destination pages after enqueueing it and
+    // before its own submit. A request the queue handed over by itself, half
+    // full, could run before that: `filled` waits out an array that still
+    // holds zeros, but one that holds the numbers of its last use looks
+    // filled, and the bytes go to those pages (another model's or texture's)
+    // while the pages meant for them keep what they held: a model that never
+    // shows for the rest of the run. Measured in victory-dedsec (565f003) on
+    // this title: none of 81,920 requests had its array changed after the
+    // title's submit; of the 2,079 a half-full queue submitted by itself
+    // 1,421 had, and 5 were caught writing the pages named before. So a queue
+    // submits by itself only when it is full, above;
+    // `VICTORY_DSTORAGE_HALF_SUBMIT=1` brings the half-full rule back.
+    if half_submit() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
+}
+
+/// Times a full queue was handed to the workers before the title's submit.
+static FULL_SUBMITS: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_DSTORAGE_HALF_SUBMIT=1`: a queue hands what it holds to the
+/// workers by itself once it is half full, as before.
+fn half_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF_SUBMIT").is_some_and(|v| v == "1"))
 }
 
 extern "system" fn submit(this: QueueRef) {
@@ -1301,9 +1339,7 @@ mod tests {
         assert_eq!(buffers[3], contents[..16]);
     }
 
-    #[test]
-    fn half_a_queue_submits_itself() {
-        let (_dir, file) = file_with(&pattern(64));
+    fn small_queue() -> *mut c_void {
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
@@ -1315,12 +1351,42 @@ mod tests {
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        queue
+    }
+
+    #[test]
+    fn half_a_queue_waits_for_the_titles_submit() {
+        let (_dir, file) = file_with(&pattern(64));
+        let queue = small_queue();
         let array = status_array(1);
+        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
         let mut out = [0u8; 16];
         enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
+        enqueue_status(queue, array, 0); // the second of four
+        // The title may still be naming the destination: nothing runs.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!done(array, 0));
+        assert_eq!(out, [0u8; 16]);
+        void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, pattern(64)[8..24]);
+    }
+
+    #[test]
+    fn a_full_queue_submits_itself() {
+        let (_dir, file) = file_with(&pattern(64));
+        let queue = small_queue();
+        let array = status_array(2);
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        enqueue(queue, &request(0, a.as_mut_ptr().cast(), 16, file, 8, 16));
+        enqueue(queue, &request(0, b.as_mut_ptr().cast(), 16, file, 24, 16));
+        enqueue_status(queue, array, 0); // the third of four: one slot stays free
+        enqueue_status(queue, array, 1); // no room: the queue hands the three over
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(a, pattern(64)[8..24]);
+        assert_eq!(b, pattern(64)[24..40]);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), S_OK);
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
