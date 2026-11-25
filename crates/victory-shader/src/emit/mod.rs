@@ -397,6 +397,11 @@ fn emit_forms(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE=last`: that form only for a program nothing else brings under
+        // 64 lanes (the host refuses its pipeline as it is), tried after every other form.
+        // With `1` it comes before the approximate forms and so changes programs that ran
+        // without it; a prologue run with `1` lost the device on an RTX PRO 4500 too.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -475,6 +480,22 @@ fn emit_forms(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if wide_last {
+            let deep = form(ir::without_skips(p, true));
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches, as the last resort", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }
