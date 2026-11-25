@@ -1174,6 +1174,8 @@ fn into_destination(
             changed_while_running = count(6),
             into_mapped_pages = SEEN[0].load(Ordering::Relaxed),
             into_pages_a_copy_guarded = SEEN[1].load(Ordering::Relaxed),
+            pages_mapped_at_a_second_address = super::xmem::aliased().0,
+            pages_at_two_addresses_now = super::xmem::aliased().1,
             "dstorage: page destinations so far"
         );
     }

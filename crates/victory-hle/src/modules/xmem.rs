@@ -560,6 +560,16 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// Pages mapped at an address while already mapped at another, since the start: the title
+/// writes such a page through one address and the GPU side may guard the other.
+static ALIASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`ALIASED`], and the pages shown at more than one address right now.
+pub(crate) fn aliased() -> (u64, usize) {
+    let now = physical().shown.values().filter(|at| at.len() > 1).count();
+    (ALIASED.load(std::sync::atomic::Ordering::Relaxed), now)
+}
+
 /// The addresses the title has bytes `[offset, offset + len)` of `pages`
 /// mapped at, as ranges of address and length.
 fn mapped_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
@@ -799,11 +809,14 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     for k in 0..len / PAGE {
-        physical
+        let at = physical
             .shown
             .entry((slice.section.0 as usize, slice.index + k))
-            .or_default()
-            .push(base + k * PAGE);
+            .or_default();
+        at.push(base + k * PAGE);
+        if at.len() > 1 {
+            ALIASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     physical.views.insert(base, (len, slice));
     true

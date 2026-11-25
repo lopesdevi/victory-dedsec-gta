@@ -399,6 +399,40 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+/// `VICTORY_GUARD_FORGET=<seconds>,...`: at each of those times after the first asking, true
+/// once. A check for copies left stale by writes no guard saw (a page written through another
+/// address it is mapped at): what shows up right after was such a copy.
+fn forget_due() -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static AT: std::sync::OnceLock<(std::time::Instant, Vec<u64>)> = std::sync::OnceLock::new();
+    static DONE: AtomicUsize = AtomicUsize::new(0);
+    let (start, times) = AT.get_or_init(|| {
+        let list = std::env::var("VICTORY_GUARD_FORGET").unwrap_or_default();
+        let mut times: Vec<u64> = list.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        times.sort_unstable();
+        (std::time::Instant::now(), times)
+    });
+    // `VICTORY_GUARD_FORGET_EVERY=<seconds>`: and again every so often, so that such a copy
+    // is stale for that long at most.
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_FORGET_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    let now = start.elapsed().as_secs();
+    if every > 0 {
+        let next = NEXT.load(Ordering::Relaxed);
+        if now >= next.max(every) && NEXT.compare_exchange(next, now + every, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            return true;
+        }
+    }
+    let done = DONE.load(Ordering::Relaxed);
+    match times.get(done) {
+        Some(&at) if now >= at => DONE.compare_exchange(done, done + 1, Ordering::Relaxed, Ordering::Relaxed).is_ok(),
+        _ => false,
+    }
+}
+
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
@@ -418,6 +452,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     install();
     let mut g = guards();
+    if forget_due() {
+        // Every guarded block counts as written once: each copy of view memory is taken again.
+        let blocks = g.clean.len();
+        g.clean.clear();
+        tracing::info!(blocks, "VICTORY_GUARD_FORGET: every guarded block of title memory is taken as written, once");
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
