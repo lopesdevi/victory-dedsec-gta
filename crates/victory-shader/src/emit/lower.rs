@@ -1774,7 +1774,11 @@ impl<'a> Lower<'a> {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
                 let own = self.own_bits.totals.contains(&w);
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh, own)) {
+                let made = shape.ok_or(UNKNOWN).and_then(|sh| match sh {
+                    super::wave::Shape::Sum64 { lo, hi, mask, high } => self.count64(b, start, (lo, hi), mask, high),
+                    sh => self.shape(sh, own),
+                });
+                match made {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
@@ -1798,7 +1802,13 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
-            Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::Active(Op::AddDLo | Op::AddDHi, ..) | Shape::Prefix(Op::AddDLo | Op::AddDHi, ..) | Shape::Sum64 { .. } => {
+                // (a section's own values go through `count64`)
+                return Err("a wave sum of doubles other than a count of lanes");
+            }
+            // the mask's lanes, counted: a sum of 1 in each
+            Shape::Count(mask) => (Op::AddU, None, mask, 0, None),
+            Shape::Active(op, src, mask, ident) => (op, Some(src), mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -1813,7 +1823,7 @@ impl<'a> Lower<'a> {
                 return Ok(self.s.m.select(c, on, x, id));
             }
             Shape::Prefix(op, src, mask, ident, inclusive) => {
-                (op, src, mask, ident, Some(inclusive))
+                (op, Some(src), mask, ident, Some(inclusive))
             }
         };
         // Mesh: no host wave size can be declared, so a reduction is over this host wave
@@ -1838,9 +1848,17 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
-        let x = self.i32_of(src)?;
-        let id = self.s.m.i32(ident);
-        let x = self.s.m.select(c, on, x, id);
+        let x = match src {
+            Some(src) => {
+                let x = self.i32_of(src)?;
+                let id = self.s.m.i32(ident);
+                self.s.m.select(c, on, x, id)
+            }
+            None => {
+                let i32t = self.s.t.i32;
+                self.s.m.cast(c, Cast::ZExt, on, i32t)
+            }
+        };
         self.s.flags |= flags::WAVE_OPS;
         if op == Op::AddH {
             return match prefix {
@@ -1962,6 +1980,69 @@ impl<'a> Lower<'a> {
             r
         };
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// A dword of a sum of doubles over the wave ([`super::wave::Shape::Sum64`]), for the
+    /// section starting at `start` of block `b`. The emitter has no 64-bit floats, and the sums
+    /// the title's programs make this way are counts: of the double 1.0 in the lanes of a mask
+    /// (`WaveActiveSum` of a literal, which the console compiler keeps in double precision; the
+    /// five `water_shading:CS_TransmissionVolumetrics*` programs convert it to a float right
+    /// after). A count of a wave's lanes is 64 at most, so its double is exact: the low dword
+    /// is 0, the high one the exponent and the count's bits below its highest.
+    fn count64(&mut self, b: usize, start: usize, (lo, hi): (Value, Value), mask: Value, high: bool) -> Result<V, Why> {
+        if self.moved_constant(b, start, lo) != Some(0) || self.moved_constant(b, start, hi) != Some(0x3FF0_0000) {
+            return Err("a wave sum of doubles other than a count of lanes");
+        }
+        if !high {
+            return Ok(self.s.m.i32(0));
+        }
+        let n = self.shape(super::wave::Shape::Count(mask), false)?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // The place of the count's highest bit: 0 to 6.
+        let mut e = self.s.m.i32(0);
+        for k in [2u32, 4, 8, 16, 32, 64] {
+            let k = self.s.m.i32(k);
+            let reached = self.s.m.cmp(c, pred::IUGE, n, k);
+            let one = self.s.m.cast(c, Cast::ZExt, reached, i32t);
+            e = self.s.m.bin(c, Bin::Add, e, one);
+        }
+        let (k20, bias, fraction, zero) = (self.s.m.i32(20), self.s.m.i32(1023), self.s.m.i32(0xF_FFFF), self.s.m.i32(0));
+        let exponent = self.s.m.bin(c, Bin::Add, e, bias);
+        let exponent = self.s.m.bin(c, Bin::Shl, exponent, k20);
+        let up = self.s.m.bin(c, Bin::Sub, k20, e);
+        let below = self.s.m.bin(c, Bin::Shl, n, up);
+        let below = self.s.m.bin(c, Bin::And, below, fraction);
+        let bits = self.s.m.bin(c, Bin::Or, exponent, below);
+        let none = self.s.m.cmp(c, pred::EQ, n, zero);
+        Ok(self.s.m.select(c, none, zero, bits))
+    }
+
+    /// The constant `v` holds in every lane that runs at the section starting at `start` of
+    /// block `b`: a VGPR value that a plain `v_mov_b32` of a constant made earlier in the
+    /// block, with EXEC as the section then saves it (the section's masks lie inside that).
+    fn moved_constant(&self, b: usize, start: usize, v: Value) -> Option<u32> {
+        let insts = &self.x.p.blocks[b].insts;
+        let at = insts[..start].iter().rposition(|i| i.writes.iter().any(|w| w.1 == v))?;
+        if insts[at + 1..start]
+            .iter()
+            .any(|i| i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some())
+        {
+            return None;
+        }
+        let inst = &insts[at];
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_mov_b32" || f.dpp.is_some() || f.sdwa.is_some() || f.abs != 0 || f.neg != 0 || f.clamp || f.omod != 0
+        {
+            return None;
+        }
+        match *f.src.first()? {
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
     }
 
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's
