@@ -255,6 +255,9 @@ struct Lower<'a> {
     /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
     /// read of one needs nothing from the other host wave.
     uniform: HashSet<Value>,
+    /// With `exchange` and [`with_halves_together`]: what the first-lane reads write that
+    /// each half reads for itself ([`first_lane_alike`]).
+    first_alike: HashSet<Value>,
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -499,6 +502,193 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// For a console wave64 program run as two host waves (`exchange`) and stopped at a first-lane
+/// read where not every lane runs ([`with_halves_together`]): the values such reads write whose
+/// source every lane of a console wave holds alike, read where the lanes of a wave run all or
+/// none. The two halves of a wave then take every branch around the read together and hold the
+/// same value, so each half's own first lane gives what the console's does. Also the lane
+/// conditions that hold in all lanes of a wave or in none, as their atoms.
+///
+/// It is the greatest set closed under these rules. A value every lane of a wave holds alike
+/// is written from constants, scalars and such values by an instruction the lanes of a wave
+/// run all or none, over an old value that is one too; or read from LDS at such an address; or
+/// is a thread's index in a one-row group shifted right by six or more (the number of its
+/// wave); or joins such values over edges the lanes of a wave take all or none. A lane
+/// condition is all or none in a wave when it is made of scalar tests, of compares of such
+/// values, and of joins of such conditions.
+fn first_lane_alike(p: &Program, st: &Structured, row: bool) -> (HashSet<Value>, HashSet<Atom>) {
+    #[derive(Clone, Copy)]
+    enum Def {
+        Phi(usize, usize),
+        Inst(usize, usize),
+    }
+    let thread = p.inputs.iter().find(|i| i.0 == Reg::V(0)).map(|i| i.1);
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let follows = |inst: &Inst| match &inst.fields {
+        Fields::Valu(v) => {
+            let name = inst.name();
+            v.dpp.is_none()
+                && v.sdwa.is_none()
+                && !name.starts_with("v_mbcnt")
+                && !name.starts_with("v_cmpx")
+                && !name.contains("lane")
+        }
+        Fields::Ds { gds, .. } => !*gds && inst.name() == "ds_read_b32",
+        _ => false,
+    };
+    let mut defs: HashMap<Value, Def> = HashMap::new();
+    // every value a VALU instruction writes: the lane conditions compares make
+    let mut made: HashMap<Value, (usize, usize)> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (k, phi) in block.phis.iter().enumerate() {
+            if matches!(phi.reg, Reg::V(_)) {
+                defs.insert(phi.value, Def::Phi(b, k));
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            if matches!(inst.fields, Fields::Valu(_)) {
+                for w in &inst.writes {
+                    made.insert(w.1, (b, i));
+                }
+            }
+            if follows(inst) {
+                for w in inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))) {
+                    defs.insert(w.1, Def::Inst(b, i));
+                }
+            }
+        }
+    }
+    let mut values: HashSet<Value> = defs.keys().copied().collect();
+    let mut atoms: HashSet<Atom> = HashSet::new();
+    {
+        let mut note = |b: Bool| atoms.extend(st.bools.support(b));
+        for b in 0..p.blocks.len() {
+            note(st.reach[b]);
+            if let LaneExit::Branch { when, .. } = &st.exits[b] {
+                note(*when);
+            }
+            for g in st.guards[b].iter().flatten() {
+                note(*g);
+            }
+        }
+        for conditions in st.phi_masks.values() {
+            for &b in conditions {
+                note(b);
+            }
+        }
+        for &b in st.masks.values() {
+            note(b);
+        }
+        for &b in st.scc_some.values() {
+            note(b);
+        }
+    }
+    atoms.retain(|a| matches!(a, Atom::Uniform(_) | Atom::Lane(_) | Atom::Phi(_)));
+    let whole = |b: Bool, atoms: &HashSet<Atom>| st.bools.support(b).iter().all(|a| atoms.contains(a));
+    let operands = |inst: &Inst, values: &HashSet<Value>, atoms: &HashSet<Atom>| match &inst.fields {
+        Fields::Valu(v) => v.src.iter().all(|op| match *op {
+            Operand::Vector { reg, .. } => {
+                let read: Vec<Value> =
+                    inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                !read.is_empty() && read.iter().all(|x| values.contains(x))
+            }
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).is_none_or(|x| {
+                !is_mask(x) || {
+                    let low = st.highs.get(&x).copied().unwrap_or(x);
+                    st.masks.get(&low).is_some_and(|&m| whole(m, atoms))
+                }
+            }),
+            _ => true,
+        }),
+        Fields::Ds {
+            addr: Some(Operand::Vector { reg, .. }),
+            ..
+        } => inst.read(Reg::V(*reg)).is_some_and(|x| values.contains(&x)),
+        _ => false,
+    };
+    loop {
+        let next_atoms: HashSet<Atom> = atoms
+            .iter()
+            .copied()
+            .filter(|a| match *a {
+                // A scalar test is each half's own; one a mask operation set by "some lane has it"
+                // is the same in both halves only if that lane condition is all or none.
+                Atom::Uniform(v) => st.scc_some.get(&v).is_none_or(|&bit| whole(bit, &atoms)),
+                Atom::Lane(v) => made.get(&v).is_some_and(|&(b, i)| operands(&p.blocks[b].insts[i], &values, &atoms)),
+                Atom::Phi(v) => st.phi_masks.get(&v).is_some_and(|all| all.iter().all(|&b| whole(b, &atoms))),
+                _ => false,
+            })
+            .collect();
+        let next_values: HashSet<Value> = values
+            .iter()
+            .copied()
+            .filter(|v| match defs[v] {
+                Def::Phi(b, k) => {
+                    let block = &p.blocks[b];
+                    block.phis[k].args.iter().all(|a| values.contains(a))
+                        && whole(st.reach[b], &atoms)
+                        && block.preds.iter().all(|&q| {
+                            whole(st.reach[q], &atoms)
+                                && match &st.exits[q] {
+                                    LaneExit::Branch { when, .. } => whole(*when, &atoms),
+                                    LaneExit::Indirect => false,
+                                    _ => true,
+                                }
+                        })
+                }
+                Def::Inst(b, i) => {
+                    let inst = &p.blocks[b].insts[i];
+                    let wave_number = row
+                        && thread.is_some()
+                        && inst.name() == "v_lshrrev_b32"
+                        && inst.read(Reg::V(0)) == thread
+                        && matches!(&inst.fields, Fields::Valu(v) if matches!(v.src.as_slice(),
+                            [Operand::Const(k), Operand::Vector { reg: 0, .. }]
+                                if crate::resource::inline(*k).is_some_and(|n| (6..32).contains(&n))));
+                    let old = match &inst.fields {
+                        Fields::Valu(v) => match v.dst {
+                            Some(Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                            _ => None,
+                        },
+                        Fields::Ds {
+                            dst: Some(Operand::Vector { reg, .. }),
+                            ..
+                        } => inst.read(Reg::V(*reg)),
+                        _ => None,
+                    };
+                    st.guards[b][i].is_none_or(|g| whole(g, &atoms) && old.is_none_or(|o| values.contains(&o)))
+                        && (wave_number || operands(inst, &values, &atoms))
+                }
+            })
+            .collect();
+        let same = next_atoms.len() == atoms.len() && next_values.len() == values.len();
+        (atoms, values) = (next_atoms, next_values);
+        if same {
+            break;
+        }
+    }
+    let mut alike = HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if inst.name() != "v_readfirstlane_b32" {
+                continue;
+            }
+            let Fields::Valu(v) = &inst.fields else { continue };
+            let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+                continue;
+            };
+            if inst.read(Reg::V(reg)).is_some_and(|x| values.contains(&x))
+                && whole(st.reach[b], &atoms)
+                && st.guards[b][i].is_none_or(|g| whole(g, &atoms))
+                && let Some(w) = inst.writes.first()
+            {
+                alike.insert(w.1);
+            }
+        }
+    }
+    (alike, atoms)
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -958,6 +1148,23 @@ thread_local! {
 /// operations promise; a program that takes one wave to be its whole
 /// thread group gets per-half results. The last resort for programs that
 /// do not translate otherwise.
+thread_local! {
+    /// The lowering follows the halves of a console wave together ([`with_halves_together`]).
+    static TOGETHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the two host waves of a console wave followed together where they go
+/// together ([`first_lane_alike`]): a first-lane read of a value every lane of the wave
+/// holds alike, where the lanes of a wave run all or none, is each half's own and needs no
+/// exchange (and so no group barrier where not every lane of the group runs). Exact. Tried
+/// only for programs that do not translate otherwise.
+pub(super) fn with_halves_together<R>(f: impl FnOnce() -> R) -> R {
+    let was = TOGETHER.replace(true);
+    let r = f();
+    TOGETHER.set(was);
+    r
+}
+
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
     let was = LOCAL_ANY.replace(true);
     let r = with_local_waves(f);
@@ -1508,6 +1715,13 @@ impl<'a> Lower<'a> {
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                _ => HashSet::new(),
+            },
+            first_alike: match &exchange {
+                Some((_, false, _)) if !LOCAL_WAVES.get() && TOGETHER.get() => {
+                    let row = matches!(x.native.io, StageIo::Cs(cs) if cs.threads[1] == 1 && cs.threads[2] == 1);
+                    first_lane_alike(p, x.st, row).0
+                }
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -7284,7 +7498,7 @@ impl<'a> Lower<'a> {
                         inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
                     }
                     _ => true,
-                };
+                } || inst.writes.first().is_some_and(|w| self.first_alike.contains(&w.1));
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {

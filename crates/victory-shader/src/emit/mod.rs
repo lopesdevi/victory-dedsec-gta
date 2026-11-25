@@ -374,6 +374,24 @@ pub fn emit(
                 }
             }
         }
+        // The halves of a console wave followed together where they go together
+        // ([`lower::with_halves_together`]): exact, and no barrier is added.
+        {
+            let again = lower::with_halves_together(|| emit_program(c, native, p, st, io, res));
+            report("halves together", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_halves_together(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("halves together, {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+        }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
