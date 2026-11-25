@@ -25,8 +25,15 @@ developer or publisher.
 ## lopesdevi/victory-dedsec: what this copy adds (2026-11-24)
 
 A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork), a few commits on top of its
-`main` (`2119b0e`). Nothing here changes how the title is translated; these are tools and limits.
-The sections below this one are fxceless's and describe that fork and its test machine.
+`main` (`2119b0e`): tools and limits first (2026-11-24), then fixes to DirectStorage and one more
+translation form (2026-11-25, below). The sections below this one are fxceless's and describe that
+fork and its test machine.
+
+**State on 2026-11-25, on the machine below: the prologue's cutscene and first room at 3 frames per
+second (300 to 350 ms a frame, about 5,000 draws a frame, `VICTORY_RELAY=1`); 25,587 of the pack's
+25,889 distinct shader containers translate, 302 do not; all 52 containers of the ray-tracing
+structure builder translate (49 before), and the builder is still off: run whole, it brings the
+title down. Indirect light is missing (characters out of the sun are silhouettes).**
 
 Test machine of this copy: Windows Server 2025, 32-core Xeon, 123 GB RAM, NVIDIA RTX PRO 4500
 (Blackwell, 32 GB). What the device reports (`victory pso-repro`): shader model 6.8, waves of 32
@@ -57,8 +64,26 @@ pipelines). Of the 25 compute pipelines the host refuses, 24 expect 64-lane wave
 stays off: a prologue run with it lost the device on this card too. In the prologue 710 draws and
 dispatches a frame are dropped, 705 of them stages of the ray-tracing structure builder, which is off.
 
-Not run for this copy: the whole test suite and clippy (the wave64 tests of `victory-shader` pass on
-this card).
+### 2026-11-25: DirectStorage, stale copies, the structure builder's three programs
+
+| Change | What was measured |
+|--------|-------------------|
+| A DirectStorage queue hands its requests over at the title's submit, not half full | The title names a request's destination pages after enqueueing it. Under the half-full rule, of 94,208 page-destination requests in a run 4,158 were handed over by the queue itself, 3,955 of those had their page array changed afterwards, 7 were caught writing the pages named before and 28 failed; with the queue submitting by itself only when full: 0 in seven runs. Same 61.6 us a draw, 5,841 draws a frame against 4,957 |
+| DirectStorage's writes into physical pages are told to the copies of title memory | The copies guard addresses, and those writes go through a view of the runtime's own: 4,434 to 7,353 of some 80,000 such writes in a run landed in pages a copy had already taken, and it was never taken again |
+| `VICTORY_GUARD_FORGET=<s>,...`, `VICTORY_GUARD_FORGET_EVERY=<s>`, a count of pages mapped at two addresses | The first room comes without its walls, floor and window grate in about half the runs (also with the two fixes above). They are stale copies: in a run without them at 278 s they were there at 322 s, after every copy was taken again at 292 s. The title keeps some 55,000 pages (3.5 GB) mapped at two addresses at once, and the guards know nothing of that. The switch is a stopgap; the fix is to guard every address of a page |
+| Wave64 on a host of 32: the halves of a console wave followed together | Three programs of the structure builder (`39321a95`, `77360df2`, `9fc111d3`) stopped at "a first-lane read where not every lane runs". The value read is the same in every lane of a wave, in a loop the lanes of a wave run all or none: each half's own first lane gives it. Tried only for programs that do not translate otherwise. All three now validate (`dxil.dll`) and get a pipeline on this card |
+| `VICTORY_MEMORY_COPIES=<n>` | With all 53 of its pipelines the builder ran for the first time (`VICTORY_BVH_BUILDER=1`), named all 1,023 copies of title memory a shader can reach within three seconds, read zeros from there, and the title died. With 16,383 it no longer runs out, and the title still dies some 14 s after the builder's first stage: its stages are not right yet |
+
+Still as before: `f133e35e` ("a lane mask exchanged where not every lane runs"), the five
+`shadowmask:CS_TraceShadowRays_*` programs, and the rest of the 302 (195 are one geometry shader,
+`GS_VoxelizeGeneric`; 80 are pixel programs whose descriptor is chosen by control flow or read only
+as data; 10 use ordered pixel shading; 8 use half of an interpolation by itself; 5 need doubles).
+`--console series-s` loses the device at the first frame of the world.
+
+Tests on this machine at this commit: `victory-shader` 210 passed (2 ignored), `victory-gpu` 110
+(1 ignored), `victory-hle` 96 and 1, `victory-loader` 24; its `load_probe` test fails here as it
+does without these changes (the probe DLL does not link with this toolchain). Clippy reports
+nothing in the files these changes touch.
 
 ## Status of this fork (2026-11-25)
 
