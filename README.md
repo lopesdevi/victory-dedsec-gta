@@ -49,10 +49,11 @@ All from this machine, 2026-11-25. The window caption's numbers are the layer's 
 | ![Cellmates](docs/screenshots/03-prologue-cellmates.jpg) A shot of the opening cutscene | ![Close-up](docs/screenshots/04-prologue-closeup.jpg) Gameplay, camera turned to the player |
 | ![Corridor](docs/screenshots/05-prologue-corridor.jpg) Corridor of the prison, 6 fps | ![Boat](docs/screenshots/06-open-world-boat.jpg) Open world, first mission on the water: note the black water (below) |
 | ![Mission failed](docs/screenshots/07-mission-failed.jpg) The mission-failed screen, 139 minutes into the session (the overlay in the corner is a monitoring tool's) | ![Before](docs/screenshots/08-before-missing-face.jpg) The base without the DirectStorage change, one launch of three: the face is not drawn |
+| ![Water](docs/screenshots/09-open-water-after.jpg) The same water with `VICTORY_WAVE_WIDE=last` (below): drawn, with small black blocks left; the boat sits under the surface | |
 
 ## What this repository adds to `VIwork`
 
-Three commits so far, each with what was measured when it went in.
+Four commits so far, each with what was measured when it went in.
 
 - **DirectStorage: a queue hands its requests over at the title's own submit, not by itself when
   half full** (`77f25f8`). The title names a request's destination pages after enqueueing it. A
@@ -70,24 +71,41 @@ Three commits so far, each with what was measured when it went in.
   `ShallowWaterSim:CS_MinTimestepReduce`, dropped eight times a frame on open water, translates
   and validates.
 
+- **Wave64 on a card of 32-lane waves: the wave-wide form as the last resort**
+  (`VICTORY_WAVE_WIDE=last`, `af93247`; off unless set). A console wave of 64 lanes runs here as
+  two host waves. A program that no other form brings under 64 lanes is refused by the driver; with
+  the option it is given the form with group barriers inside branches, and only such a program is
+  (22 translations of the pack change, the rest are byte for byte the same). In the open world it
+  takes the compute pipelines this card refuses from 7 to 3: the two tiled water programs above,
+  `sr_tracing:CS_Tiling_Generate_Opaque` and `GpuParticleUpdate:CS_Visibility` run; the three whose
+  thread groups hold several console waves stay refused. All five `CS_TransmissionVolumetrics`
+  programs translate with it.
+
 For the two shader changes, every other translation of the pack is byte for byte what it was
-(25,719 cache entries compared). **Their effect in the game has not been measured yet**: they are
-what the black water of the screenshot above is being tested against.
+(25,719 cache entries compared). In the game, on this card: `ShallowWaterSim:CS_MinTimestepReduce`
+runs; the two tiled water programs translate but are wave64 programs the driver refuses, until
+`VICTORY_WAVE_WIDE=last` gives them a 32-lane form. With it the open water is drawn (last
+screenshot above) where it was black, at the same speed (median 172 ms a frame over 17 minutes, no
+crash or device loss).
 
 `victory warm` now translates 25,723 of the 25,746 shader containers it takes from the title's
-pack and its ray-tracing builder library (25,719 on the base); 23 are refused.
+pack and its ray-tracing builder library (25,719 on the base); 23 are refused (21 with
+`VICTORY_WAVE_WIDE=last`).
 
 ## Known problems
 
 - **Speed.** Of some 170 to 230 ms a frame in the open world, about 140 are the CPU preparing
   copies of title memory; the card takes 14 to 24 ms and is idle about half of the time.
-- **Water.** Large patches of open water come out black, with blocky edges. Two more water
-  programs (`CS_TransmissionVolumetricsSubmerged`, `CS_WaterTransmittanceOpticalDepthProcessing`)
-  still do not translate.
+- **Water.** Without `VICTORY_WAVE_WIDE=last` large patches of open water come out black on a
+  card of 32-lane waves. With it small black blocks remain, and
+  `CS_WaterTransmittanceOpticalDepthProcessing` still does not translate.
+- **Boats.** In the first mission on the water the boat sits below the surface and its engine
+  fails, so the mission cannot be finished. The cause is not known yet; the title's water height
+  look-ups are being followed.
 - **Light.** No ray-traced light: shade is dark.
 - **Textures.** Some surfaces of the prologue show wrong textures.
 - **Refused by the driver.** Five compute pipelines of wave64 programs were refused by this card's
-  driver in that session.
+  driver in that session, seven on open water; three with `VICTORY_WAVE_WIDE=last`.
 - **Faces.** See above: missing in one launch of three on the base, not seen since the
   DirectStorage change, in too few launches to call it fixed.
 - **One machine.** One PC, one card, one driver.
@@ -114,6 +132,8 @@ cargo build --profile diag -p victory --features diagnostics
 # every shader into the cache first (about 25 minutes with the compute pipelines)
 target\diag\victory.exe warm <game dir>\shaders.rpf <game dir>\XboxBvhBuilder.dll
 
+# on a card whose waves have 32 lanes only (set it for the warm too: it is part of the cache key)
+$env:VICTORY_WAVE_WIDE = 'last'
 target\diag\victory.exe run <game dir>\<the title's exe> --execute --console series-x
 ```
 
