@@ -1176,6 +1176,8 @@ fn into_destination(
             into_pages_a_copy_guarded = SEEN[1].load(Ordering::Relaxed),
             pages_mapped_at_a_second_address = super::xmem::aliased().0,
             pages_at_two_addresses_now = super::xmem::aliased().1,
+            addresses_guarded_for_another = victory_gpu::title_memory_alias_counts().0,
+            writes_caught_through_another_address = victory_gpu::title_memory_alias_counts().1,
             "dstorage: page destinations so far"
         );
     }

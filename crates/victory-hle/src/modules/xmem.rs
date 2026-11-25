@@ -808,6 +808,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    // And which pages: a copy guarded at another address of one of them is taken again.
+    victory_gpu::title_memory_shows(base, len, slice.section.0 as usize, slice.index);
     for k in 0..len / PAGE {
         let at = physical
             .shown

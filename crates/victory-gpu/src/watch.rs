@@ -571,6 +571,16 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        // The other addresses of these pages: a write through one of them is a write here.
+        // They are guarded and not noted clean: nothing was copied from them.
+        for block in from..to {
+            for other in aliases(block) {
+                if !g.protected.contains(&other) && set(other, other + 1) {
+                    g.protected.insert(other);
+                    ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -601,15 +611,121 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
+/// What each mapped block of view memory shows: a physical page, by its section and its index
+/// in it ([`title_memory_shows`]), and the blocks each page is shown at.
+///
+/// The title maps a page at two addresses at once (in the prologue some 55,000 pages, 3.5 GB,
+/// are) and writes it through one while a copy was taken, and guarded, at the other: that
+/// write faulted nowhere, and the copy stayed as it was for good. The first room came without
+/// its walls, floor and window grate in about half the runs for it; taking every copy again
+/// brought them back (`VICTORY_GUARD_FORGET`). So a block that is guarded has every other
+/// address of its page guarded with it ([`protect`]), and a write through any opens them all
+/// ([`open`]). `VICTORY_GUARD_ALIASES=0` leaves the other addresses alone, as before.
+#[derive(Default)]
+struct Shown {
+    page: std::collections::HashMap<usize, (usize, usize)>,
+    at: std::collections::HashMap<(usize, usize), Vec<usize>>,
+}
+
+static SHOWN: std::sync::LazyLock<Mutex<Shown>> = std::sync::LazyLock::new(|| Mutex::new(Shown::default()));
+
+/// Blocks guarded only because another address of their page is, and writes caught through
+/// one address that opened a copy taken at another, since the start.
+static ALIASES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`ALIASES`], for the log.
+pub fn title_memory_alias_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (ALIASES[0].load(Relaxed), ALIASES[1].load(Relaxed))
+}
+
+fn aliases_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ALIASES").is_none_or(|v| v != "0"))
+}
+
+/// The other blocks that show the page `block` shows. (The lock is the last one taken: nothing
+/// is locked while it is held.)
+fn aliases(block: usize) -> Vec<usize> {
+    if !aliases_on() {
+        return Vec::new();
+    }
+    let shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    match shown.page.get(&block).and_then(|page| shown.at.get(page)) {
+        Some(at) if at.len() > 1 => at.iter().copied().filter(|&b| b != block).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The runtime mapped `len` bytes at `at` that show the pages of `section` from `index` on
+/// (after [`title_memory_remapped`] for the range). A page that is guarded at another address
+/// is opened there: its copy is taken again, and this address is guarded with it from then on.
+pub fn title_memory_shows(at: usize, len: usize, section: usize, index: usize) {
+    if !aliases_on() {
+        return;
+    }
+    let mut others = Vec::new();
+    {
+        let mut shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        for k in 0..len / BLOCK {
+            let (block, page) = (at / BLOCK + k, (section, index + k));
+            shown.page.insert(block, page);
+            let at = shown.at.entry(page).or_default();
+            others.extend(at.iter().copied().filter(|&b| b != block));
+            if !at.contains(&block) {
+                at.push(block);
+            }
+        }
+    }
+    if others.is_empty() {
+        return;
+    }
+    let mut g = guards();
+    for block in others {
+        open(&mut g, block * BLOCK, (block + 1) * BLOCK);
+    }
+}
+
+/// The range no longer shows what it did ([`title_memory_remapped`]).
+fn shows_nothing(at: usize, len: usize) {
+    if !aliases_on() {
+        return;
+    }
+    let mut shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
+        if let Some(page) = shown.page.remove(&block)
+            && let Some(at) = shown.at.get_mut(&page)
+        {
+            at.retain(|&b| b != block);
+            if at.is_empty() {
+                shown.at.remove(&page);
+            }
+        }
+    }
+}
+
 /// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
+/// notes them written, and with them the other addresses of their pages; true if any was
+/// guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
+    let mut blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    // A write through one address of a page is a write at all of them.
+    let first = blocks.len();
+    for i in 0..first {
+        for other in aliases(blocks[i]) {
+            if g.protected.contains(&other) && !blocks.contains(&other) {
+                if g.clean.contains(&other) {
+                    ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                blocks.push(other);
+            }
+        }
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -707,6 +823,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    shows_nothing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -815,6 +932,57 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A page mapped at two addresses: a write through one opens the copy guarded at the
+    /// other, and without the runtime's word about the mapping it does not.
+    #[test]
+    fn a_write_through_another_address_of_a_page_is_seen() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of one block, mapped twice read-write.
+        let (section, a, b) = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (
+                section as usize,
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize,
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize,
+            )
+        };
+        assert!(a != 0 && b != 0 && a != b);
+        title_memory_shows(a, BLOCK, section, 0);
+        title_memory_shows(b, BLOCK, section, 0);
+        // A copy takes the page at `b`: new, then clean.
+        assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
+        assert_eq!(guard(b, b + BLOCK), Some(Vec::new()));
+        // The title writes it through `a`: the handler opens both addresses.
+        // SAFETY: mapped memory of ours; `b` shows the same page.
+        unsafe {
+            (a as *mut u8).write(7);
+            assert_eq!((b as *const u8).read(), 7);
+        }
+        assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
+        assert_eq!(guard(b, b + BLOCK), Some(Vec::new()));
+        // A third address mapped while the copy is clean: the copy is taken again.
+        // SAFETY: the same section once more.
+        let c = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize };
+        assert_ne!(c, 0);
+        title_memory_shows(c, BLOCK, section, 0);
+        assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
+        // SAFETY: mapped; the write goes through the newest address.
+        unsafe { (c as *mut u8).add(1).write(9) };
+        assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
+        for at in [a, b, c] {
+            shows_nothing(at, BLOCK);
+            open(&mut guards(), at, at + BLOCK);
+            // SAFETY: our views.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ });
+            }
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

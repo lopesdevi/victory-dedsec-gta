@@ -64,5 +64,5 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
 #[cfg(windows)]
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
-    written_elsewhere as title_memory_written_elsewhere,
+    title_memory_alias_counts, title_memory_shows, written_elsewhere as title_memory_written_elsewhere,
 };
