@@ -801,6 +801,26 @@ fn half_submit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF_SUBMIT").is_some_and(|v| v == "1"))
 }
 
+/// Writes into pages the title has mapped, and those of them that found a
+/// copy of the GPU side guarding the addresses (one it took before the
+/// bytes landed).
+static SEEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// After a write into a destination's pages: the GPU side is told for the
+/// addresses the title has them mapped at (`xmem::pages_written`).
+/// `VICTORY_DSTORAGE_PAGES_UNSEEN=1` only counts, as before.
+fn seen(pages: &[usize], offset: usize, len: usize) {
+    static TELL: OnceLock<bool> = OnceLock::new();
+    let tell = *TELL.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_PAGES_UNSEEN").is_none_or(|v| v != "1"));
+    let (mapped, guarded) = super::xmem::pages_written(pages, offset, len, tell);
+    if mapped > 0 {
+        SEEN[0].fetch_add(1, Ordering::Relaxed);
+    }
+    if guarded > 0 {
+        SEEN[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn page_states(pages: &[usize]) -> Vec<&'static str> {
     pages.iter().map(|&p| super::xmem::page_state(p)).collect()
 }
@@ -1152,6 +1172,8 @@ fn into_destination(
             changed_after_the_titles_submit = count(4),
             changed_after_the_queues_submit = count(5),
             changed_while_running = count(6),
+            into_mapped_pages = SEEN[0].load(Ordering::Relaxed),
+            into_pages_a_copy_guarded = SEEN[1].load(Ordering::Relaxed),
             "dstorage: page destinations so far"
         );
     }
@@ -1159,12 +1181,15 @@ fn into_destination(
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         let result = fill(window.bytes()).map(drop);
+        drop(window);
+        seen(pages, offset, len);
         ran_early(&used, pages, run, auto, since);
         return result;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
+        seen(pages, offset, n);
         ran_early(&used, pages, run, auto, since);
         return Ok(());
     }

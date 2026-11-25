@@ -14,11 +14,16 @@
 //! wholly uncommitted are skipped while they remain so; one query can
 //! confirm a whole region, including ordinary reservations between views.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! Writes into physical pages through another view (xmem's
+//! `write_physical`, DirectStorage's page destinations) do not fault at
+//! the guarded addresses: the runtime tells us of them
+//! ([`written_elsewhere`]) for every address the title has those pages
+//! mapped at. They were once taken to go only to the texture pool, whose
+//! textures are hashed, not guarded; a title's models arrive that way too,
+//! into buffers a copy may have taken already.
+//!
+//! shortcut: a system call writing into a guarded block fails (none is
+//! known to).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -573,6 +578,22 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
     !blocks.is_empty()
+}
+
+/// Title memory `[at, at + len)` was written through another view of its
+/// physical pages (the runtime's DirectStorage, into pages the title also
+/// has mapped here): no write faulted at these addresses. With `tell`, its
+/// guarded blocks are opened and noted written, so the copies that took
+/// them take them again. True if a copy had guarded any (without `tell`,
+/// only that is answered: what a run without the telling leaves stale).
+pub fn written_elsewhere(at: usize, len: usize, tell: bool) -> bool {
+    let mut g = guards();
+    let end = at.saturating_add(len);
+    if tell {
+        open(&mut g, at, end)
+    } else {
+        g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).next().is_some()
+    }
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

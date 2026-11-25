@@ -370,6 +370,9 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Where each page is mapped: by its section and its index in it, the
+    /// addresses the views show it at ([`pages_written`]).
+    shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -555,6 +558,47 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         (within, done) = (0, done + k);
     }
     true
+}
+
+/// The addresses the title has bytes `[offset, offset + len)` of `pages`
+/// mapped at, as ranges of address and length.
+fn mapped_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let physical = physical();
+    let end = offset + len;
+    let mut ranges = Vec::new();
+    for (i, page) in pages
+        .iter()
+        .enumerate()
+        .take(end.div_ceil(PAGE))
+        .skip(offset / PAGE)
+    {
+        let Some(slice) = physical.pages.get(page) else {
+            continue;
+        };
+        let (from, to) = (offset.max(i * PAGE) - i * PAGE, end.min((i + 1) * PAGE) - i * PAGE);
+        let key = (slice.section.0 as usize, slice.index);
+        for &at in physical.shown.get(&key).into_iter().flatten() {
+            ranges.push((at + from, to - from));
+        }
+    }
+    ranges
+}
+
+/// Bytes `[offset, offset + len)` of `pages` were written through a view of
+/// ours (a DirectStorage destination), after the write: the GPU side is
+/// told for every address the title has those pages mapped at. Its copies
+/// of title memory guard addresses, not pages, so a copy taken before the
+/// bytes landed (of a model's vertices, say) kept what the pages held
+/// before, and nothing made it take them again. Without `tell` it is only
+/// asked. Returns how many address ranges there were and how many of them
+/// a copy had guarded.
+pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize, tell: bool) -> (usize, usize) {
+    let ranges = mapped_at(pages, offset, len);
+    let guarded = ranges
+        .iter()
+        .filter(|&&(at, n)| victory_gpu::title_memory_written_elsewhere(at, n, tell))
+        .count();
+    (ranges.len(), guarded)
 }
 
 /// What a page number is right now, for a DirectStorage destination that
@@ -754,6 +798,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    for k in 0..len / PAGE {
+        physical
+            .shown
+            .entry((slice.section.0 as usize, slice.index + k))
+            .or_default()
+            .push(base + k * PAGE);
+    }
     physical.views.insert(base, (len, slice));
     true
 }
@@ -832,6 +883,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        for k in 0..size / PAGE {
+            let key = (slice.section.0 as usize, slice.index + k);
+            if let Some(addresses) = physical.shown.get_mut(&key) {
+                addresses.retain(|&a| a != at + k * PAGE);
+                if addresses.is_empty() {
+                    physical.shown.remove(&key);
+                }
+            }
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1118,6 +1178,14 @@ mod tests {
         }
         // Writes into pages (DirectStorage's) show through their views.
         assert!(write_physical(&pages[2..], 1, &[9]));
+        // And are told for each address the page is mapped at: the third
+        // page at both, the first at one.
+        let mut third = mapped_at(&pages[2..], 1, 1);
+        third.sort_unstable();
+        let mut both = [(at(a, 2) as usize + 1, 1), (at(b, 1) as usize + 1, 1)];
+        both.sort_unstable();
+        assert_eq!(third, both);
+        assert_eq!(mapped_at(&pages, 0, PAGE + 2), [(a as usize, PAGE), (at(a, 1) as usize, 2)]);
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
 
