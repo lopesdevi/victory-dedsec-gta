@@ -557,6 +557,20 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// What a page number is right now, for a DirectStorage destination that
+/// could not be written: `known`; `freed` (handed out once and given back:
+/// numbers are never handed out twice); or `never` a page of ours.
+pub(crate) fn page_state(number: usize) -> &'static str {
+    let physical = physical();
+    if physical.pages.contains_key(&number) {
+        "known"
+    } else if (0x10_0000..physical.next_page).contains(&number) && number.is_multiple_of(FRAMES) {
+        "freed"
+    } else {
+        "never"
+    }
+}
+
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.

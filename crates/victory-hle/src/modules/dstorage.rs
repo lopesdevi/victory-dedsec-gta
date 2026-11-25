@@ -564,7 +564,10 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    note_submitted(&request);
+                    lane.reads.push_back((seq, request));
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -709,11 +712,117 @@ impl Status {
     }
 }
 
+/// What tells one request from another while it waits to run.
+type Identity = (usize, u64, u64, usize);
+
+fn identity(request: &Request) -> Identity {
+    (
+        request.destination as usize,
+        request.page_offset,
+        request.offset,
+        request.source as usize,
+    )
+}
+
+/// The page numbers each request's array held when it was enqueued, oldest
+/// first: a destination that cannot be written is told apart by them: pages
+/// the title gave back before the request ran, an array filled after the
+/// request was enqueued, or one whose memory holds something else by then.
+static ENQUEUED_PAGES: std::sync::LazyLock<Mutex<HashMap<Identity, VecDeque<Trace>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A request's page array as it was when enqueued and when handed to the
+/// workers (and whether the queue did that by itself, half full).
+struct Trace {
+    enqueued: Vec<usize>,
+    at: std::time::Instant,
+    submitted: Option<(Vec<usize>, bool)>,
+}
+
+/// Whether the submit under way is the queue's own (half full), not the title's.
+static AUTO_SUBMIT: AtomicBool = AtomicBool::new(false);
+
+/// The page numbers of a request's destination array as it is now.
+fn page_array(request: &Request) -> Vec<usize> {
+    let n = ((request.page_offset & 0xffff) as usize + request.destination_size as usize).div_ceil(PAGE);
+    // SAFETY: the title passes a page number per 64 KiB of destination.
+    unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), n) }.to_vec()
+}
+
+/// Notes a request's page array as it is handed to the workers.
+fn note_submitted(request: &Request) {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
+        return;
+    }
+    let auto = AUTO_SUBMIT.load(Ordering::Relaxed);
+    let now = page_array(request);
+    let mut all = ENQUEUED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(trace) = all
+        .get_mut(&identity(request))
+        .and_then(|q| q.iter_mut().find(|t| t.submitted.is_none()))
+    {
+        trace.submitted = Some((now, auto));
+    }
+}
+
+/// Requests with a page destination so far: 0 run; 1 with an array that
+/// changed between enqueue and run (the title's usual order); 2 failed; 3
+/// handed to the workers by the queue itself; 4 and 5 with an array that
+/// changed after the title, or the queue itself, handed them to the
+/// workers; 6 with an array that changed while they ran. The last three
+/// stay at 0 while the rule in `queue` holds for a title.
+static PAGE_COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// A request that ran on the pages its array named before the title wrote
+/// the ones it meant: counted and, for the first, said.
+fn ran_early(used: &[usize], pages: &[usize], run: u64, auto: Option<bool>, since: Option<std::time::Instant>) {
+    if used == pages {
+        return;
+    }
+    let n = PAGE_COUNTS[6].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 20 {
+        tracing::warn!(
+            n,
+            run,
+            auto = ?auto,
+            used = ?used,
+            used_states = ?page_states(used),
+            now = ?pages,
+            since_enqueue_us = since.map(|at| at.elapsed().as_micros() as u64),
+            "dstorage: a destination's page array changed while its request ran: its data went to the pages named before"
+        );
+    }
+}
+
+/// `VICTORY_DSTORAGE_HALF_SUBMIT=1`: a queue hands what it holds to the
+/// workers by itself once it is half full.
+fn half_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF_SUBMIT").is_some_and(|v| v == "1"))
+}
+
+fn page_states(pages: &[usize]) -> Vec<&'static str> {
+    pages.iter().map(|&p| super::xmem::page_state(p)).collect()
+}
+
 extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     // SAFETY: the title passes its request (null tolerated).
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
+    if request.options & PAGE_DESTINATION != 0 && !request.destination.is_null() {
+        let trace = Trace {
+            enqueued: page_array(&request),
+            at: std::time::Instant::now(),
+            submitted: None,
+        };
+        ENQUEUED_PAGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(identity(&request))
+            .or_default()
+            .push_back(trace);
+    }
     queue(this, Command::Read(request));
 }
 
@@ -748,6 +857,20 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        // Full of what the title has not submitted: nothing else would make
+        // room, so the queue hands it to the workers itself.
+        let held = lane.unsubmitted.len();
+        if held > 0 {
+            AUTO_SUBMIT.store(true, Ordering::Relaxed);
+            lanes.submit(id);
+            AUTO_SUBMIT.store(false, Ordering::Relaxed);
+            scheduler.work.notify_all();
+            tracing::warn!(
+                held,
+                "dstorage: a full queue the title has not submitted is handed to the workers; \
+                 it may not have named every destination yet"
+            );
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -757,8 +880,18 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    // The title names a request's destination pages after enqueueing it and
+    // before its own submit: in a run of the title none of 81,920 requests
+    // had its page array changed after the title's submit, while of the
+    // 2,079 a half-full queue submitted by itself 1,421 had, and 5 were
+    // caught writing the pages their array named before (another model's or
+    // texture's, which then never showed). So a queue submits by itself
+    // only when it is full, above; `VICTORY_DSTORAGE_HALF_SUBMIT=1` brings
+    // the half-full rule back.
+    if half_submit() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+        AUTO_SUBMIT.store(true, Ordering::Relaxed);
         lanes.submit(id);
+        AUTO_SUBMIT.store(false, Ordering::Relaxed);
         scheduler.work.notify_all();
     }
 }
@@ -966,16 +1099,89 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
+    let trace = {
+        let mut all = ENQUEUED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let key = identity(request);
+        let first = all.get_mut(&key).and_then(VecDeque::pop_front);
+        if all.get(&key).is_some_and(VecDeque::is_empty) {
+            all.remove(&key);
+        }
+        first
+    };
+    let used = pages.to_vec();
+    let since = trace.as_ref().map(|t| t.at);
+    let enqueued = trace.as_ref().map(|t| t.enqueued.clone());
+    let auto = trace.as_ref().and_then(|t| t.submitted.as_ref()).map(|s| s.1);
+    let run = PAGE_COUNTS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if auto == Some(true) {
+        PAGE_COUNTS[3].fetch_add(1, Ordering::Relaxed);
+    }
+    if enqueued
+        .as_deref()
+        .and_then(|e| e.get(..pages.len()))
+        .is_some_and(|then| then != pages)
+    {
+        PAGE_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some((then, auto)) = trace.as_ref().and_then(|t| t.submitted.as_ref())
+        && let Some(then) = then.get(..pages.len())
+        && then != pages
+    {
+        let n = PAGE_COUNTS[if *auto { 5 } else { 4 }].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 20 {
+            tracing::warn!(
+                n,
+                run,
+                auto,
+                submitted = ?then,
+                submitted_states = ?page_states(then),
+                now = ?pages,
+                now_states = ?page_states(pages),
+                since_enqueue_us = since.map(|at| at.elapsed().as_micros() as u64),
+                "dstorage: a destination's page array changed after its request was handed to the workers"
+            );
+        }
+    }
+    if run.is_multiple_of(4096) {
+        let count = |i: usize| PAGE_COUNTS[i].load(Ordering::Relaxed);
+        tracing::info!(
+            run,
+            changed_since_enqueue = count(1),
+            failed = count(2),
+            handed_over_by_the_queue = count(3),
+            changed_after_the_titles_submit = count(4),
+            changed_after_the_queues_submit = count(5),
+            changed_while_running = count(6),
+            "dstorage: page destinations so far"
+        );
+    }
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let result = fill(window.bytes()).map(drop);
+        ran_early(&used, pages, run, auto, since);
+        return result;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
+        ran_early(&used, pages, run, auto, since);
+        return Ok(());
+    }
+    {
+        // What the array names now and named when the request was enqueued,
+        // and what those pages are: given back since, or never ours.
+        let failed = PAGE_COUNTS[2].fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            failed,
+            run,
+            auto = ?auto,
+            now = ?pages,
+            now_states = ?page_states(pages),
+            enqueued = ?enqueued,
+            enqueued_states = ?enqueued.as_deref().map(page_states),
+            "dstorage: the pages of the destination that follows, when it ran and when it was enqueued"
+        );
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
@@ -1239,9 +1445,7 @@ mod tests {
         assert_eq!(buffers[3], contents[..16]);
     }
 
-    #[test]
-    fn half_a_queue_submits_itself() {
-        let (_dir, file) = file_with(&pattern(64));
+    fn small_queue() -> *mut c_void {
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
@@ -1253,12 +1457,42 @@ mod tests {
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        queue
+    }
+
+    #[test]
+    fn half_a_queue_waits_for_the_titles_submit() {
+        let (_dir, file) = file_with(&pattern(64));
+        let queue = small_queue();
         let array = status_array(1);
+        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
         let mut out = [0u8; 16];
         enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
+        enqueue_status(queue, array, 0); // the second of four
+        // The title may still be naming the destination: nothing runs.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!done(array, 0));
+        assert_eq!(out, [0u8; 16]);
+        void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, pattern(64)[8..24]);
+    }
+
+    #[test]
+    fn a_full_queue_submits_itself() {
+        let (_dir, file) = file_with(&pattern(64));
+        let queue = small_queue();
+        let array = status_array(2);
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        enqueue(queue, &request(0, a.as_mut_ptr().cast(), 16, file, 8, 16));
+        enqueue(queue, &request(0, b.as_mut_ptr().cast(), 16, file, 24, 16));
+        enqueue_status(queue, array, 0); // the third of four: one slot stays free
+        enqueue_status(queue, array, 1); // no room: the queue hands the three over
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(a, pattern(64)[8..24]);
+        assert_eq!(b, pattern(64)[24..40]);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), S_OK);
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
