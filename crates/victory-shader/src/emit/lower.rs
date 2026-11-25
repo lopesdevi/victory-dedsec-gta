@@ -7253,7 +7253,16 @@ impl<'a> Lower<'a> {
                     return Err("a mixed-precision result");
                 };
                 let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
+                    Some(o) => match self.i32_of(o) {
+                        Ok(x) => x,
+                        // The half that stays is a value no translation follows (the first
+                        // half of an interpolation left in the register, say): nothing is
+                        // lost where nothing reads that half of the result.
+                        Err(why) => match inst.write(Reg::V(reg)) {
+                            Some(w) if self.other_half_unread(w, name == "v_fma_mixlo_f16") => self.s.m.i32(0),
+                            _ => return Err(why),
+                        },
+                    },
                     None => self.s.m.i32(0),
                 };
                 let h = self
@@ -8043,6 +8052,61 @@ impl<'a> Lower<'a> {
         };
         let m16 = k(self, 0xFFFF);
         Ok(self.s.m.bin(c, Bin::And, r, m16))
+    }
+
+    /// Whether nothing reads the half of `value` that a mixed-precision instruction left as
+    /// it was (`low`: the instruction wrote the low half): every reader takes the written
+    /// f16 half as a source, or writes the whole register over, or writes the other half.
+    fn other_half_unread(&self, value: Value, low: bool) -> bool {
+        for (b, block) in self.x.p.blocks.iter().enumerate() {
+            if block.phis.iter().any(|phi| phi.args.contains(&value)) {
+                return false;
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                if !inst.reads.iter().any(|r| r.1 == value) {
+                    continue;
+                }
+                let Fields::Valu(v) = &inst.fields else {
+                    return false;
+                };
+                let name = inst.name();
+                if v.sdwa.is_some() || v.dpp.is_some() {
+                    return false;
+                }
+                for (k, op) in v.src.iter().enumerate() {
+                    let Operand::Vector { reg, .. } = *op else {
+                        continue;
+                    };
+                    if inst.read(Reg::V(reg)) != Some(value) {
+                        continue;
+                    }
+                    let written_half = match name {
+                        "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                            v.opsel_hi >> k & 1 != 0 && (v.opsel >> k & 1 != 0) != low
+                        }
+                        "v_cvt_f32_f16" => low && v.opsel == 0,
+                        _ => false,
+                    };
+                    if !written_half {
+                        return false;
+                    }
+                }
+                // as the old value of the register the reader writes
+                if matches!(v.dst, Some(Operand::Vector { reg, .. }) if inst.read(Reg::V(reg)) == Some(value)) {
+                    let fine = match name {
+                        // keeps the half that is known, writes the other
+                        "v_fma_mixhi_f16" => low,
+                        "v_fma_mixlo_f16" => !low,
+                        // writes all of it, in every lane that gets there
+                        _ => self.x.st.guards[b][i].is_none() && !name.contains("lane"),
+                    };
+                    if !fine {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
