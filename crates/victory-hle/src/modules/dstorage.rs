@@ -1102,13 +1102,18 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        // Raw reads land through the kernel, which does not fault into the GPU side's guard
+        // on title buffers. Opening the guard first is not enough: a copy can guard the
+        // block again before the kernel writes it, the more so now that every address of a
+        // guarded page is guarded (a run lost a 47,632-byte read that way, and the title
+        // with it). So into memory of ours, and from there over as the title's own writes
+        // go: through the guard's handler.
+        let mut data = vec![0u8; len];
+        let n = fill(&mut data)?.min(len);
+        // SAFETY: the title's destination holds `destination_size` bytes, at least `len`,
+        // and nothing else writes it until completion.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), request.destination.cast::<u8>(), n) };
+        return Ok(());
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
