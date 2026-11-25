@@ -5754,11 +5754,57 @@ impl<'a> Lower<'a> {
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
+                // The record count as well, where the code reads it: a buffer the program
+                // only asks whether it is there (`ShallowWaterSim:CS_MinTimestepReduce`
+                // compares the count with 0 around all of its work and never reads the
+                // buffer). From the host view's size, as below for a buffer that is read; a
+                // null view has none.
+                let asked = (count == 4)
+                    .then(|| inst.write(Reg::S(code + 2)))
+                    .flatten()
+                    .is_some_and(|v| {
+                        let p = self.x.p;
+                        p.blocks.iter().any(|b| {
+                            b.phis.iter().any(|phi| phi.args.contains(&v))
+                                || b.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v))
+                        })
+                    });
+                let records = if asked {
+                    let src = Source::Loaded {
+                        load: site,
+                        first: 0,
+                    };
+                    let used = self.used_kind(&src);
+                    let u = if used.is_some_and(|u| u.kind == ResourceType::Uav) {
+                        0x1000
+                    } else {
+                        0
+                    };
+                    let h = self.handle(site, &src, false, (11 | u, 0))?;
+                    let (c, i32t) = (self.cur, self.s.t.i32);
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let mip = self.s.m.undef(i32t);
+                    let d = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                    // A raw view counts bytes; the descriptor's record count is in elements.
+                    let n = self.s.m.extract(c, d, 0);
+                    let stride = used.map_or(0, |u| u.stride);
+                    Some(if stride > 1 {
+                        let k = self.s.m.i32(stride);
+                        self.s.m.bin(c, Bin::UDiv, n, k)
+                    } else {
+                        n
+                    })
+                } else {
+                    None
+                };
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
+                    match (k, records) {
+                        (0, _) => self.write(inst, reg, lo, None),
+                        (1, _) => self.write(inst, reg, hi, None),
+                        (2, Some(n)) => self.write(inst, reg, n, None),
                         _ => {
                             if let Some(v) = inst.write(reg) {
                                 self.vals.insert(v, Val::Missing(OTHER));
