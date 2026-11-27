@@ -563,11 +563,22 @@ fn workers() -> bool {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                    // `VICTORY_PIPELINE_LOWEST=normal`: level with the title's
+                    // own threads, for a PC whose processors the layer's
+                    // threads keep busy (4 cores, 8 threads: the 536 to 680
+                    // pipelines queued at the start of the world took 15
+                    // minutes of play, and each frame in which a draw asked
+                    // for one 300 to 430 ms; runs of 2026-11-27).
+                    let asked = std::env::var("VICTORY_PIPELINE_LOWEST").ok();
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                        let priority = match asked.as_deref().map(str::trim) {
+                            Some("normal") => THREAD_PRIORITY_NORMAL,
+                            Some("0") => THREAD_PRIORITY_BELOW_NORMAL,
+                            _ if screens_only => THREAD_PRIORITY_BELOW_NORMAL,
+                            _ => THREAD_PRIORITY_LOWEST,
+                        };
                         let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
