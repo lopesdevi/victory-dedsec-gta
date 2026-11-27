@@ -109,7 +109,8 @@ $start.Add_Click({
         $gameDir = [System.IO.Path]::GetFullPath($path)
         $info = New-Object System.Diagnostics.ProcessStartInfo
         $info.FileName = $runner
-        $info.Arguments = 'run "{0}" --console series-s --execute' -f (Join-Path $gameDir $gameExe)
+        $console = if ($env:VICTORY_CONSOLE) { $env:VICTORY_CONSOLE } else { 'series-x' }
+        $info.Arguments = 'run "{0}" --console {1} --execute' -f (Join-Path $gameDir $gameExe), $console
         $info.WorkingDirectory = $root
         $info.UseShellExecute = $false
         $info.EnvironmentVariables['VICTORY_GAME_DIR'] = $gameDir
