@@ -34,6 +34,7 @@ $defaults = @{
     VICTORY_UPLOAD_AHEAD = '1'
     VICTORY_LEVELS_ON_DEMAND = '1'
     VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    VICTORY_WAVE_WIDE = 'last'
 }
 
 $form = New-Object System.Windows.Forms.Form
