@@ -407,7 +407,7 @@ fn bench_indirect_draw_barriers() {
                     (&src, u64::from(first * STEP)),
                     None,
                     (0, STEP, records),
-                    if window > 1 { AHEAD } else { 0 },
+                    window > 1,
                 ));
                 state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
                 list.SetPipelineState(&pso);
