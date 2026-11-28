@@ -1813,9 +1813,12 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         let mut options = abi::DlssgOptions::new(if on { abi::DLSSG_ON } else { abi::DLSSG_OFF });
         // `VICTORY_FRAMEGEN_X=2..6`: frames shown for each one rendered (2 unless set), no more
         // than this card and driver generate (the state says how many: 5 on an RTX 50).
+        // Switching off too: off with more frames than the card generates is refused
+        // ("invalid state", 38), frame generation stays on, and the switch is asked again
+        // at every present (an L40S, which generates one, with the menu's 3X: 3,291
+        // refusals in the two and a half minutes of a menu and a load).
         let mut generated = wanted.max(2) - 1;
-        if on
-            && generated > 1
+        if generated > 1
             && let Some(get_state) = functions.dlssg_get_state
         {
             let mut state = abi::DlssgState::default();
@@ -1823,7 +1826,9 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
             let most = if code == 0 { state.num_frames_to_generate_max.max(1) } else { 1 };
             if generated > most {
-                tracing::warn!(asked = generated + 1, given = most + 1, "DLSS Frame Generation: more frames asked than this card generates");
+                if on {
+                    tracing::warn!(asked = generated + 1, given = most + 1, "DLSS Frame Generation: more frames asked than this card generates");
+                }
                 generated = most;
             }
         }
