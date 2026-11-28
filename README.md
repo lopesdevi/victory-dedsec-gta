@@ -56,7 +56,9 @@ of the layer's own five-second lines, first ten minutes in the world, 2026-11-27
 
 These figures are from the base as it was on 2026-11-27 (`29d8dbf`) with the two changes
 [below](#what-this-repository-adds). The tree is now at upstream's v2026.11.28.03 with the same
-two changes. It builds here; its frame rates have not been measured here yet.
+two changes. It builds and starts here (title screen at the 30 fps cap, DLSS and frame
+generation loaded, no pipeline left to make); its frame rates in the world have not been
+measured here yet.
 
 ### Other PCs, as their owners measured them
 
@@ -152,9 +154,11 @@ VICTORY_PIPELINE_LOWEST=normal
 | `VICTORY_MENU_DLSS=performance` | DLSS Performance; it does not raise the frame rate on this PC and costs nothing |
 | `VICTORY_MENU_FRAMEGEN=2` | frame generation 2x, what an RTX 40-class card generates |
 
-Before the first session, make the pipelines the game drew with ahead of time:
-`victory.exe warm --used` with the launcher's switches set made 225 to 248 of them in 17 to 52
-seconds here. The full set is about 83,700 pipelines, an estimated 4 hours on this processor.
+Before a session, make the pipelines the game drew with ahead of time: `victory.exe warm --used`
+with the launcher's switches set. After a new build it took 6 minutes here (3,598 pipelines),
+after `victory.exe shaders` had translated the 25,719 shaders again in 4 minutes; between
+sessions of the same build, 17 to 52 seconds (225 to 248 pipelines). The full set is about
+83,700 pipelines, an estimated 4 hours on this processor.
 
 ## Long sessions
 
